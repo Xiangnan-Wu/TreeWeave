@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "treeweave"
+version = "0.1.0"
+description = "TreeWeave: Orthogonal Spatiotemporal Representation Weaving for Qwen3.5 MLLMs (ms-swift Training + vLLM/SGLang Offline Rollout & Serving)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=5.2.0",
+    "ms-swift>=4.0.0",
+    "safetensors>=0.4.0",
+    "numpy>=1.26.0",
+    "pillow>=10.0.0",
+    "qwen-vl-utils>=0.0.14",
+]
+
+[project.scripts]
+treeweave-init = "treeweave.serving.init_checkpoint:main"
+treeweave-rollout = "treeweave.rollout.offline_rollout:main"
+treeweave-cache-topk = "treeweave.rollout.cache_topk_logits:main"
+treeweave-calibrate = "treeweave.serving.calibrate_router:main"
+treeweave-train = "treeweave.swift_plugin.cli:main"
+treeweave-serve = "treeweave.serving.serve:main"
+treeweave-prepare = "treeweave.serving.prepare:main"
+
+[tool.setuptools.packages.find]
+include = ["treeweave*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
