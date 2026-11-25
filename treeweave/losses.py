@@ -118,6 +118,7 @@ def chunked_topk_kl_distill_loss(
     teacher_lm_head: Optional[nn.Module] = None,
     teacher_topk_indices: Optional[torch.Tensor] = None,
     teacher_topk_logprobs: Optional[torch.Tensor] = None,
+    teacher_topk_valid_mask: Optional[torch.Tensor] = None,
     topk: int = 512,
     temperature: float = 1.0,
     reduction: str = "token_mean",
@@ -128,6 +129,9 @@ def chunked_topk_kl_distill_loss(
     Peak memory on Qwen3.5 (`vocab_size = 248,320`) for `chunk_size = 1024` is `< 0.5 GB` instead of `48 GB`!
 
     Args:
+        teacher_topk_valid_mask: Optional 1D bool tensor `(N_active,)`. Tokens with `False`
+            (e.g. a single pos-0 BPE boundary token on legacy pre-fix Top-K caches) receive
+            zero loss and zero gradient while preserving exact KL on all valid tokens.
         reduction:
             - `"token_mean"`: Global mean over all supervised response tokens (VisionWeave Stages 2 & 3).
             - `"sample_sqrt_len"`: Weights each sample's mean token KL by `sqrt(|y_m|)` (VisionWeave Stage 1).
@@ -142,6 +146,12 @@ def chunked_topk_kl_distill_loss(
         raise ValueError(
             "Provide either `(teacher_topk_indices, teacher_topk_logprobs)` or `(teacher_active_hidden, teacher_lm_head)`."
         )
+    if teacher_topk_valid_mask is not None:
+        if teacher_topk_valid_mask.ndim != 1 or int(teacher_topk_valid_mask.shape[0]) != n_tok:
+            raise ValueError(
+                f"`teacher_topk_valid_mask` must be 1D `(N_active,)` matching N_active={n_tok}, "
+                f"got {tuple(teacher_topk_valid_mask.shape)}."
+            )
     if use_offline_topk:
         assert teacher_topk_indices is not None and teacher_topk_logprobs is not None
         if teacher_topk_indices.ndim != 2 or teacher_topk_logprobs.ndim != 2:
@@ -176,6 +186,7 @@ def chunked_topk_kl_distill_loss(
                 break
         return dummy
 
+    valid_mask_cpu_or_dev = teacher_topk_valid_mask
     per_token_kl = []
     for start in range(0, n_tok, chunk_size):
         end = min(start + chunk_size, n_tok)
@@ -190,6 +201,10 @@ def chunked_topk_kl_distill_loss(
             if k_eff < t_idx.shape[-1]:
                 t_idx = t_idx[:, :k_eff]
                 t_vals = t_vals[:, :k_eff]
+            if valid_mask_cpu_or_dev is not None:
+                v_chunk = valid_mask_cpu_or_dev[start:end].to(device=s_logits.device, dtype=torch.bool)
+                # Sanitize masked rows BEFORE softmax/KL so `0.0 * NaN` can never leak into autograd!
+                t_vals = torch.where(v_chunk.unsqueeze(-1), t_vals, torch.zeros_like(t_vals))
             # Re-normalize over `k_eff` in case cached topk > requested topk or unnormalized logits were stored
             t_log_p = F.log_softmax(t_vals, dim=-1)
         else:
@@ -209,19 +224,33 @@ def chunked_topk_kl_distill_loss(
 
     token_kls = torch.cat(per_token_kl, dim=0)
 
+    valid_mask: Optional[torch.Tensor] = None
+    if teacher_topk_valid_mask is not None:
+        valid_mask = teacher_topk_valid_mask.to(device=token_kls.device, dtype=torch.bool)
+        masked_kls = torch.where(valid_mask, token_kls, torch.zeros_like(token_kls))
+    else:
+        masked_kls = token_kls
+
     if reduction == "token_mean" or sample_ids is None:
-        return token_kls.mean()
+        if valid_mask is None:
+            return masked_kls.mean()
+        valid_f = valid_mask.to(dtype=masked_kls.dtype)
+        return masked_kls.sum() / valid_f.sum().clamp_min(1.0)
 
     if reduction == "sample_sqrt_len":
         unique_ids, inverse = torch.unique(sample_ids.to(token_kls.device), sorted=True, return_inverse=True)
         num_samples = unique_ids.shape[0]
         counts = torch.zeros(num_samples, dtype=torch.float32, device=token_kls.device)
         sums = torch.zeros(num_samples, dtype=torch.float32, device=token_kls.device)
-        ones = torch.ones_like(token_kls, dtype=torch.float32)
-        counts.scatter_add_(0, inverse, ones)
-        sums.scatter_add_(0, inverse, token_kls)
+        valid_f = (
+            valid_mask.to(dtype=torch.float32)
+            if valid_mask is not None
+            else torch.ones_like(token_kls, dtype=torch.float32)
+        )
+        counts.scatter_add_(0, inverse, valid_f)
+        sums.scatter_add_(0, inverse, masked_kls)
         sample_means = sums / counts.clamp_min(1.0)
-        weights = torch.sqrt(counts.clamp_min(1.0))
+        weights = torch.sqrt(counts)
         return (weights * sample_means).sum() / weights.sum().clamp_min(1.0)
 
     raise ValueError(f"Unsupported reduction: {reduction!r}.")

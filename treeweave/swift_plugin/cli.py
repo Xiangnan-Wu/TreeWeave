@@ -124,8 +124,8 @@ class TreeWeaveSftArguments(SftArguments):
             from swift.utils import get_logger
 
             get_logger().info_once(
-                f"[TreeWeave] Using exact segment-isolated varlen execution for `--packing true` with attn_impl={self.attn_impl!r}. "
-                "On 8xH100, pass `--attn_impl flash_attn` with `flash-linear-attention` + `causal-conv1d` installed for fused CUDA varlen kernels."
+                f"[TreeWeave] Using single-pass fused GatedDeltaNet + inner per-segment varlen SDPA for `--packing true` "
+                f"with attn_impl={self.attn_impl!r} (zero outer segment loop, zero O(L^2) mask)."
             )
             return
         super()._check_padding_free()

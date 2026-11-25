@@ -13,6 +13,7 @@ GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
 TOPK_BATCH_SIZE="${TOPK_BATCH_SIZE:-4}"
 TOPK_MAX_TOKENS="${TOPK_MAX_TOKENS:-16384}"
 TOPK_ATTN_IMPL="${TOPK_ATTN_IMPL:-auto}"
+LOSS_SCALE="${LOSS_SCALE:-default+ignore_empty_think}"
 
 python -m treeweave.rollout.cache_topk_logits \
   --teacher-model "${NATIVE_MODEL_DIR}" \
@@ -24,6 +25,7 @@ python -m treeweave.rollout.cache_topk_logits \
   --max-batch-tokens "${TOPK_MAX_TOKENS}" \
   --pack-sequences \
   --attn-impl "${TOPK_ATTN_IMPL}" \
+  --loss-scale "${LOSS_SCALE}" \
   --topk 512 \
   --temperature 1.0 \
   --image-max-tokens 4096 \

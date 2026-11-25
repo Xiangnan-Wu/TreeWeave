@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -29,17 +29,26 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 __all__ = [
     "TreeWeaveAttentionVolumeAdapter",
     "active_token_log_volumes",
+    "active_varlen_bounds",
     "install_volume_bias_on_language_model",
+    "varlen_bounds_context",
     "volume_bias_context",
 ]
 
 _ACTIVE_LOG_VOLUMES: ContextVar[Optional[torch.Tensor]] = ContextVar(
     "treeweave_active_token_log_volumes", default=None
 )
+_ACTIVE_VARLEN_BOUNDS: ContextVar[Optional[Tuple[int, ...]]] = ContextVar(
+    "treeweave_active_varlen_bounds", default=None
+)
 
 
 def active_token_log_volumes() -> Optional[torch.Tensor]:
     return _ACTIVE_LOG_VOLUMES.get()
+
+
+def active_varlen_bounds() -> Optional[Tuple[int, ...]]:
+    return _ACTIVE_VARLEN_BOUNDS.get()
 
 
 @contextmanager
@@ -51,6 +60,17 @@ def volume_bias_context(token_log_volumes: Optional[torch.Tensor]):
         yield
     finally:
         _ACTIVE_LOG_VOLUMES.set(prev)
+
+
+@contextmanager
+def varlen_bounds_context(bounds: Optional[Sequence[int]]):
+    """Bind pre-fetched CPU segment boundaries `(0, L1, L1+L2, ...)` once per forward pass (0 GPU->CPU syncs per layer)."""
+    prev = _ACTIVE_VARLEN_BOUNDS.get()
+    _ACTIVE_VARLEN_BOUNDS.set(tuple(int(x) for x in bounds) if bounds is not None else None)
+    try:
+        yield
+    finally:
+        _ACTIVE_VARLEN_BOUNDS.set(prev)
 
 
 class TreeWeaveAttentionVolumeAdapter(nn.Module):
@@ -165,11 +185,20 @@ def _make_patched_qwen3_5_attn_forward(attn_mod: Qwen3_5Attention) -> Callable:
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         use_adapter = adapter is not None and adapter.mode != "none"
-        attn_impl = getattr(attn_mod.config, "_attn_implementation", "sdpa")
+        attn_impl = str(getattr(attn_mod.config, "_attn_implementation", "sdpa"))
+        cu_q = kwargs.get("cu_seq_lens_q")
+        is_varlen_sdpa = (
+            past_key_values is None
+            and "flash" not in attn_impl
+            and cu_q is not None
+            and isinstance(cu_q, torch.Tensor)
+            and int(cu_q.numel()) > 2
+            and query_states.shape[0] == 1
+        )
 
         if use_adapter and log_vols is not None and log_vols.shape[:2] == input_shape[:2]:
-            # If key_direction mode OR flash_attention_2 varlen is active, inject into post-k_norm keys BEFORE KV cache!
-            if adapter.mode == "key_direction" or "flash" in str(attn_impl):
+            # If key_direction mode OR flash_attention_* varlen is active, inject into post-k_norm keys BEFORE KV cache!
+            if adapter.mode == "key_direction" or "flash" in attn_impl:
                 key_states = adapter.apply_to_keys(key_states, log_vols)
 
         if past_key_values is not None:
@@ -177,7 +206,7 @@ def _make_patched_qwen3_5_attn_forward(attn_mod: Qwen3_5Attention) -> Callable:
                 key_states, value_states, attn_mod.layer_idx
             )
 
-        if use_adapter and adapter.mode == "exact_logit_bias" and "flash" not in str(attn_impl):
+        if use_adapter and adapter.mode == "exact_logit_bias" and "flash" not in attn_impl and not is_varlen_sdpa:
             past_len_before = 0
             if past_key_values is not None:
                 past_len_before = key_states.shape[2] - query_states.shape[2]
@@ -204,16 +233,60 @@ def _make_patched_qwen3_5_attn_forward(attn_mod: Qwen3_5Attention) -> Callable:
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             attn_impl, eager_attention_forward
         )
-        attn_output, attn_weights = attention_interface(
-            attn_mod,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not attn_mod.training else attn_mod.attention_dropout,
-            scaling=attn_mod.scaling,
-            **kwargs,
-        )
+        drop_p = 0.0 if not attn_mod.training else attn_mod.attention_dropout
+        if is_varlen_sdpa:
+            # Single-pass packed varlen SDPA: ALL 24 GatedDeltaNet layers + all 32 QKV/MLP/Norm/RoPE layers
+            # run ONCE on the full `[1, L_packed, D]` tensor; only the inner attention op isolates packed segments!
+            bounds = active_varlen_bounds()
+            if bounds is None or len(bounds) != int(cu_q.numel()):
+                bounds = tuple(int(x) for x in cu_q.detach().cpu().tolist())
+            seg_kwargs = {
+                k: v
+                for k, v in kwargs.items()
+                if k not in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+            }
+            use_exact_seg = (
+                use_adapter
+                and adapter.mode == "exact_logit_bias"
+                and log_vols is not None
+                and log_vols.shape[:2] == input_shape[:2]
+            )
+            out_parts: List[torch.Tensor] = []
+            for s_i, e_i in zip(bounds[:-1], bounds[1:]):
+                if e_i <= s_i:
+                    continue
+                q_s = query_states[:, :, s_i:e_i, :]
+                k_s = key_states[:, :, s_i:e_i, :]
+                v_s = value_states[:, :, s_i:e_i, :]
+                mask_s = (
+                    adapter.augment_attention_mask(None, log_vols[:, s_i:e_i], q_s)
+                    if use_exact_seg
+                    else None
+                )
+                seg_out, _ = attention_interface(
+                    attn_mod,
+                    q_s,
+                    k_s,
+                    v_s,
+                    mask_s,
+                    dropout=drop_p,
+                    scaling=attn_mod.scaling,
+                    **seg_kwargs,
+                )
+                out_parts.append(seg_out)
+            attn_output = out_parts[0] if len(out_parts) == 1 else torch.cat(out_parts, dim=1)
+            attn_weights = None
+        else:
+            attn_output, attn_weights = attention_interface(
+                attn_mod,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=drop_p,
+                scaling=attn_mod.scaling,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
@@ -223,13 +296,27 @@ def _make_patched_qwen3_5_attn_forward(attn_mod: Qwen3_5Attention) -> Callable:
     return forward
 
 
+def _wrap_linear_attn_strip_volume_kwarg(linear_attn: nn.Module) -> None:
+    """Prevent `treeweave_token_log_volumes` in `**kwargs` from reaching raw `causal_conv1d_fn(**kwargs)`."""
+    if getattr(linear_attn, "_treeweave_kwarg_stripped", False):
+        return
+    orig_fwd = linear_attn.forward
+
+    def _safe_linear_forward(*args, **kwargs):
+        kwargs.pop("treeweave_token_log_volumes", None)
+        return orig_fwd(*args, **kwargs)
+
+    linear_attn.forward = _safe_linear_forward  # type: ignore[method-assign]
+    linear_attn._treeweave_kwarg_stripped = True
+
+
 def install_volume_bias_on_language_model(
     language_model: nn.Module,
     *,
     mode: str = "key_direction",
     gamma_init: float = 1.0,
 ) -> int:
-    """Attach `TreeWeaveAttentionVolumeAdapter` to every `Qwen3_5Attention` layer in `language_model`."""
+    """Attach `TreeWeaveAttentionVolumeAdapter` + varlen-safe SDPA to every `Qwen3_5Attention` layer."""
     text_cfg = language_model.config
     rope_params = getattr(text_cfg, "rope_parameters", None) or {}
     partial_factor = float(rope_params.get("partial_rotary_factor", 0.25))
@@ -238,6 +325,9 @@ def install_volume_bias_on_language_model(
 
     installed = 0
     for layer in language_model.layers:
+        lin_attn = getattr(layer, "linear_attn", None)
+        if lin_attn is not None:
+            _wrap_linear_attn_strip_volume_kwarg(lin_attn)
         attn = getattr(layer, "self_attn", None)
         if not isinstance(attn, Qwen3_5Attention):
             continue
@@ -254,4 +344,5 @@ def install_volume_bias_on_language_model(
         else:
             attn.treeweave_volume_bias.mode = mode
         installed += 1
+    language_model._treeweave_varlen_sdpa_patched = installed > 0
     return installed

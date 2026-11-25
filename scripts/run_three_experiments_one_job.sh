@@ -7,11 +7,12 @@
 #
 # Hardware Default: `GPU_ARCH=b300` (NVIDIA B300 Blackwell Ultra, 288 GB HBM3e per GPU, sm103)
 #   - Disables activation recomputation (`GRADIENT_CHECKPOINTING=false`, ~1.5x faster on 288 GB VRAM!)
+#   - Uses `bs=2, ga=2` packed microbatches (49K tokens/microbatch, 2x larger GEMMs & 2x fewer syncs)
 #   - Scales rollout (`max_batch_size=256`) & Top-K caching (`batch_size=16, max_tokens=32768`)
 #   - Uses larger Stage 3 per-device microbatch (`bs=8`, 4x fewer grad-accum steps)
-#   - Auto-detects `flash_attn` vs native B300 cuDNN `sdpa` (`ATTN_IMPL=auto`)
+#   - Auto-detects `flash_attn` vs native B300 single-pass varlen cuDNN `sdpa` (`ATTN_IMPL=auto`)
 #   - Never forces Hopper-only `fa3` on Blackwell (`offline_rollout.py` & `serve.py` auto-select `flashinfer`)
-#   - Set `GPU_ARCH=h100` to switch back to 80 GB H100 memory budgets.
+#   - Set `GPU_ARCH=h100` (80 GB) or `GPU_ARCH=rtx5090` (32 GB local debug) for other memory budgets.
 #
 # The 3 Built-In Minimal Comparative Experiments:
 #   - exp1 (exp1_visionweave_2d): max_spatial_level=1, max_temporal_level=0 (VisionWeave 2D baseline)
@@ -51,7 +52,9 @@ export TREEWEAVE_FORCE_PIXEL_FACTOR="${TREEWEAVE_FORCE_PIXEL_FACTOR:-128}"
 NATIVE_MODEL_DIR="${NATIVE_MODEL_DIR:-/path/to/Qwen3.5-4B}"
 RAW_DATASET_JSONL="${RAW_DATASET_JSONL:-}"
 WORK_ROOT="${WORK_ROOT:-./work_minimal}"
-GPU_ARCH="${GPU_ARCH:-b300}"                  # b300 (default, 288GB HBM3e) | h100 (80GB)
+# Persist HuggingFace datasets / ms-swift arrow cache across restarts & experiments (saves ~25--30 min/job!)
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${WORK_ROOT}/hf_datasets_cache}"
+GPU_ARCH="${GPU_ARCH:-b300}"                  # b300 (default, 288GB) | h100 (80GB) | rtx5090 (32GB)
 PROFILE="${PROFILE:-minimal}"                 # smoke | minimal | full
 EXPERIMENTS="${EXPERIMENTS:-exp1 exp2 exp3}"  # Space-separated subset of: exp1 exp2 exp3
 ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"    # vllm | sglang | auto
@@ -79,7 +82,7 @@ if [[ -z "${ATTN_IMPL:-}" || "${ATTN_IMPL}" == "auto" ]]; then
   fi
 fi
 
-# -------- Hardware-Aware Defaults (B300 288GB vs H100 80GB) --------
+# -------- Hardware-Aware Defaults (B300 288GB vs H100 80GB vs RTX 5090 32GB) --------
 case "${GPU_ARCH}" in
   b300|B300|blackwell)
     GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
@@ -88,7 +91,13 @@ case "${GPU_ARCH}" in
     TOPK_BATCH_SIZE="${TOPK_BATCH_SIZE:-16}"
     TOPK_MAX_TOKENS="${TOPK_MAX_TOKENS:-32768}"
     DEFAULT_S1_PACK=24576
-    DEFAULT_S2_PACK=32768
+    DEFAULT_S1_BS=2
+    DEFAULT_S1_GA=2
+    DEFAULT_S1_GA_FULL=2
+    DEFAULT_S2_PACK=24576
+    DEFAULT_S2_BS=2
+    DEFAULT_S2_GA=2
+    DEFAULT_S2_GA_FULL=4
     DEFAULT_S3_BS=8
     DEFAULT_S3_GA=4
     DEFAULT_S3_BS_FULL=8
@@ -101,14 +110,39 @@ case "${GPU_ARCH}" in
     TOPK_BATCH_SIZE="${TOPK_BATCH_SIZE:-4}"
     TOPK_MAX_TOKENS="${TOPK_MAX_TOKENS:-16384}"
     DEFAULT_S1_PACK=16384
+    DEFAULT_S1_BS=1
+    DEFAULT_S1_GA=4
+    DEFAULT_S1_GA_FULL=4
     DEFAULT_S2_PACK=24576
+    DEFAULT_S2_BS=1
+    DEFAULT_S2_GA=4
+    DEFAULT_S2_GA_FULL=8
     DEFAULT_S3_BS=2
     DEFAULT_S3_GA=16
     DEFAULT_S3_BS_FULL=4
     DEFAULT_S3_GA_FULL=16
     ;;
+  rtx5090|5090|RTX5090)
+    GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
+    ROLLOUT_MAX_BATCH_SIZE="${ROLLOUT_MAX_BATCH_SIZE:-16}"
+    ROLLOUT_CHUNK_SIZE="${ROLLOUT_CHUNK_SIZE:-64}"
+    TOPK_BATCH_SIZE="${TOPK_BATCH_SIZE:-2}"
+    TOPK_MAX_TOKENS="${TOPK_MAX_TOKENS:-8192}"
+    DEFAULT_S1_PACK=8192
+    DEFAULT_S1_BS=1
+    DEFAULT_S1_GA=4
+    DEFAULT_S1_GA_FULL=4
+    DEFAULT_S2_PACK=12288
+    DEFAULT_S2_BS=1
+    DEFAULT_S2_GA=4
+    DEFAULT_S2_GA_FULL=8
+    DEFAULT_S3_BS=1
+    DEFAULT_S3_GA=16
+    DEFAULT_S3_BS_FULL=1
+    DEFAULT_S3_GA_FULL=32
+    ;;
   *)
-    echo "[ERROR] Unknown GPU_ARCH='${GPU_ARCH}'. Use: b300 | h100" >&2
+    echo "[ERROR] Unknown GPU_ARCH='${GPU_ARCH}'. Use: b300 | h100 | rtx5090" >&2
     exit 1
     ;;
 esac
@@ -116,23 +150,23 @@ esac
 # -------- Profile Presets (Step Budgets & Batch Sizes) --------
 case "${PROFILE}" in
   smoke)
-    S1_STEPS="${S1_STEPS:-20}"      ; S1_SAVE="${S1_SAVE:-20}"    ; S1_GA="${S1_GA:-1}" ; S1_PACK="${S1_PACK:-4096}"
-    S2_STEPS="${S2_STEPS:-20}"      ; S2_SAVE="${S2_SAVE:-20}"    ; S2_GA="${S2_GA:-1}" ; S2_PACK="${S2_PACK:-4096}"
-    S3_STEPS="${S3_STEPS:-10}"      ; S3_SAVE="${S3_SAVE:-10}"    ; S3_BS="${S3_BS:-1}" ; S3_GA="${S3_GA:-2}" ; S3_MAXLEN="${S3_MAXLEN:-4096}"
+    S1_STEPS="${S1_STEPS:-20}"      ; S1_SAVE="${S1_SAVE:-20}"    ; S1_BS="${S1_BS:-1}"               ; S1_GA="${S1_GA:-1}" ; S1_PACK="${S1_PACK:-4096}"
+    S2_STEPS="${S2_STEPS:-20}"      ; S2_SAVE="${S2_SAVE:-20}"    ; S2_BS="${S2_BS:-1}"               ; S2_GA="${S2_GA:-1}" ; S2_PACK="${S2_PACK:-4096}"
+    S3_STEPS="${S3_STEPS:-10}"      ; S3_SAVE="${S3_SAVE:-10}"    ; S3_BS="${S3_BS:-1}"               ; S3_GA="${S3_GA:-2}" ; S3_MAXLEN="${S3_MAXLEN:-4096}"
     CALIB_SAMPLES="${CALIB_SAMPLES:-64}"
     LOG_STEPS="${LOG_STEPS:-2}"
     ;;
   minimal)
     # Designed for ~24K multimodal mix (~1.5--2.5 hours total on 8xB300, ~4--6 hours on 8xH100!)
-    S1_STEPS="${S1_STEPS:-800}"     ; S1_SAVE="${S1_SAVE:-400}"   ; S1_GA="${S1_GA:-4}" ; S1_PACK="${S1_PACK:-${DEFAULT_S1_PACK}}"
-    S2_STEPS="${S2_STEPS:-500}"     ; S2_SAVE="${S2_SAVE:-250}"   ; S2_GA="${S2_GA:-4}" ; S2_PACK="${S2_PACK:-${DEFAULT_S2_PACK}}"
+    S1_STEPS="${S1_STEPS:-800}"     ; S1_SAVE="${S1_SAVE:-400}"   ; S1_BS="${S1_BS:-${DEFAULT_S1_BS}}" ; S1_GA="${S1_GA:-${DEFAULT_S1_GA}}" ; S1_PACK="${S1_PACK:-${DEFAULT_S1_PACK}}"
+    S2_STEPS="${S2_STEPS:-500}"     ; S2_SAVE="${S2_SAVE:-250}"   ; S2_BS="${S2_BS:-${DEFAULT_S2_BS}}" ; S2_GA="${S2_GA:-${DEFAULT_S2_GA}}" ; S2_PACK="${S2_PACK:-${DEFAULT_S2_PACK}}"
     S3_STEPS="${S3_STEPS:-250}"     ; S3_SAVE="${S3_SAVE:-250}"   ; S3_BS="${S3_BS:-${DEFAULT_S3_BS}}" ; S3_GA="${S3_GA:-${DEFAULT_S3_GA}}" ; S3_MAXLEN="${S3_MAXLEN:-24576}"
     CALIB_SAMPLES="${CALIB_SAMPLES:-512}"
     LOG_STEPS="${LOG_STEPS:-10}"
     ;;
   full)
-    S1_STEPS="${S1_STEPS:-5257}"    ; S1_SAVE="${S1_SAVE:-1000}"  ; S1_GA="${S1_GA:-4}" ; S1_PACK="${S1_PACK:-${DEFAULT_S1_PACK}}"
-    S2_STEPS="${S2_STEPS:-2500}"    ; S2_SAVE="${S2_SAVE:-500}"   ; S2_GA="${S2_GA:-8}" ; S2_PACK="${S2_PACK:-${DEFAULT_S2_PACK}}"
+    S1_STEPS="${S1_STEPS:-5257}"    ; S1_SAVE="${S1_SAVE:-1000}"  ; S1_BS="${S1_BS:-${DEFAULT_S1_BS}}" ; S1_GA="${S1_GA:-${DEFAULT_S1_GA_FULL}}" ; S1_PACK="${S1_PACK:-${DEFAULT_S1_PACK}}"
+    S2_STEPS="${S2_STEPS:-2500}"    ; S2_SAVE="${S2_SAVE:-500}"   ; S2_BS="${S2_BS:-${DEFAULT_S2_BS}}" ; S2_GA="${S2_GA:-${DEFAULT_S2_GA_FULL}}" ; S2_PACK="${S2_PACK:-${DEFAULT_S2_PACK}}"
     S3_STEPS="${S3_STEPS:-1000}"    ; S3_SAVE="${S3_SAVE:-250}"   ; S3_BS="${S3_BS:-${DEFAULT_S3_BS_FULL}}" ; S3_GA="${S3_GA:-${DEFAULT_S3_GA_FULL}}" ; S3_MAXLEN="${S3_MAXLEN:-24576}"
     CALIB_SAMPLES="${CALIB_SAMPLES:-1024}"
     LOG_STEPS="${LOG_STEPS:-10}"
@@ -193,9 +227,10 @@ run_step() {
 echo "[TreeWeave-Job] Configuration:"
 echo "  GPU_ARCH=${GPU_ARCH} | PROFILE=${PROFILE} | EXPERIMENTS=${EXPERIMENTS}"
 echo "  NPROC_PER_NODE=${NPROC_PER_NODE} | GPUS=${GPUS} | ATTN_IMPL=${ATTN_IMPL} | GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING}"
+echo "  S1=(bs=${S1_BS}, ga=${S1_GA}, pack=${S1_PACK}) | S2=(bs=${S2_BS}, ga=${S2_GA}, pack=${S2_PACK}) | S3=(bs=${S3_BS}, ga=${S3_GA}, max=${S3_MAXLEN})"
 echo "  NATIVE_MODEL_DIR=${NATIVE_MODEL_DIR}"
 echo "  RAW_DATASET_JSONL=${RAW_DATASET_JSONL}"
-echo "  WORK_ROOT=${WORK_ROOT} | TB_LOG_ROOT=${TB_LOG_ROOT}"
+echo "  WORK_ROOT=${WORK_ROOT} | HF_DATASETS_CACHE=${HF_DATASETS_CACHE} | TB_LOG_ROOT=${TB_LOG_ROOT}"
 echo "  ENABLE_TOPK_CACHE=${ENABLE_TOPK_CACHE} | TREEWEAVE_FORCE_PIXEL_FACTOR=${TREEWEAVE_FORCE_PIXEL_FACTOR}"
 
 if [[ "${DRY_RUN}" != "1" && ! -d "${NATIVE_MODEL_DIR}" ]]; then
@@ -300,6 +335,7 @@ for exp_id in ${EXPERIMENTS}; do
         MAX_STEPS="${S1_STEPS}" \
         SAVE_STEPS="${S1_SAVE}" \
         LOGGING_STEPS="${LOG_STEPS}" \
+        PER_DEVICE_BS="${S1_BS}" \
         GRAD_ACCUM="${S1_GA}" \
         PACKING_LENGTH="${S1_PACK}" \
         MAX_LENGTH="${S1_PACK}" \
@@ -324,6 +360,7 @@ for exp_id in ${EXPERIMENTS}; do
         MAX_STEPS="${S2_STEPS}" \
         SAVE_STEPS="${S2_SAVE}" \
         LOGGING_STEPS="${LOG_STEPS}" \
+        PER_DEVICE_BS="${S2_BS}" \
         GRAD_ACCUM="${S2_GA}" \
         PACKING_LENGTH="${S2_PACK}" \
         MAX_LENGTH="${S2_PACK}" \

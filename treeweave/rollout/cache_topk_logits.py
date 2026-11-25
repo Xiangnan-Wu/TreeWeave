@@ -18,8 +18,9 @@ import argparse
 import copy
 import importlib.util
 import json
-import multiprocessing as mp
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -40,7 +41,9 @@ from ..swift_plugin.template import (
     Qwen3_5TreeWeaveTemplate,
     install_treeweave_resize_patch,
 )
+from ..volume_bias import install_volume_bias_on_language_model
 from .offline_rollout import (
+    _verify_and_log_gpu_pin,
     compute_sample_uuid,
     compute_topk_cache_uuid,
     enable_subprocess_resize_bootstrap,
@@ -93,6 +96,8 @@ def _atomic_save_topk(
     idx_t: torch.Tensor,
     lp_t: torch.Tensor,
     target_labels: Optional[torch.Tensor] = None,
+    source_labels: Optional[Sequence[int] | torch.Tensor] = None,
+    loss_scale: str = "default+ignore_empty_think",
 ) -> None:
     """Write `.safetensors` to a process-private temp file and `os.replace` atomically."""
     tmp_st = target_st.parent / f".{target_st.stem}.{os.getpid()}.tmp.safetensors"
@@ -102,11 +107,18 @@ def _atomic_save_topk(
     }
     if target_labels is not None:
         tensors["target_labels"] = target_labels.to(torch.int32).contiguous().cpu()
+    if source_labels is not None:
+        src_t = (
+            source_labels.detach().to(torch.int32).contiguous().cpu()
+            if isinstance(source_labels, torch.Tensor)
+            else torch.tensor(list(source_labels), dtype=torch.int32)
+        )
+        tensors["source_labels"] = src_t
     try:
         save_file(
             tensors,
             str(tmp_st),
-            metadata={"format": "pt"},
+            metadata={"format": "pt", "loss_scale": str(loss_scale)},
         )
         os.replace(tmp_st, target_st)
     except BaseException:
@@ -175,6 +187,7 @@ def _run_padded_microbatch(
     dev: torch.device,
     topk: int,
     temperature: float,
+    loss_scale: str = "default+ignore_empty_think",
 ) -> None:
     template.padding_free = False
     template.packing = False
@@ -191,6 +204,7 @@ def _run_padded_microbatch(
         "channel",
         "teacher_topk_indices",
         "teacher_topk_logprobs",
+        "teacher_topk_valid_mask",
         "cu_seq_lens_q",
         "cu_seq_lens_k",
         "max_length_q",
@@ -215,7 +229,14 @@ def _run_padded_microbatch(
                 f"Active token count mismatch in padded Top-K extraction for {item['uid']}: "
                 f"got {idx_b.shape[0]}, expected {item['exp_active']}."
             )
-        _atomic_save_topk(item["target_st"], idx_b, lp_b, target_labels=tgt_b)
+        _atomic_save_topk(
+            item["target_st"],
+            idx_b,
+            lp_b,
+            target_labels=tgt_b,
+            source_labels=item["encoded"].get("labels"),
+            loss_scale=loss_scale,
+        )
 
 
 @torch.no_grad()
@@ -227,10 +248,11 @@ def _run_packed_microbatch(
     dev: torch.device,
     topk: int,
     temperature: float,
+    loss_scale: str = "default+ignore_empty_think",
 ) -> None:
     if len(sub_batch) == 1:
         _run_padded_microbatch(
-            teacher, template, sub_batch, dev=dev, topk=topk, temperature=temperature
+            teacher, template, sub_batch, dev=dev, topk=topk, temperature=temperature, loss_scale=loss_scale
         )
         return
 
@@ -247,7 +269,7 @@ def _run_packed_microbatch(
     batch = {k: (v.to(dev) if isinstance(v, torch.Tensor) else v) for k, v in collated.items()}
     labels = batch.pop("labels")
     tpos = batch.pop("text_position_ids", None)
-    for k in ("loss_scale", "channel", "teacher_topk_indices", "teacher_topk_logprobs"):
+    for k in ("loss_scale", "channel", "teacher_topk_indices", "teacher_topk_logprobs", "teacher_topk_valid_mask"):
         batch.pop(k, None)
 
     pos_ids = batch.get("position_ids")
@@ -301,7 +323,14 @@ def _run_packed_microbatch(
     lp_splits = torch.split(all_lp, exp_counts, dim=0)
     tgt_splits = torch.split(active.target_labels, exp_counts, dim=0)
     for item, idx_s, lp_s, tgt_s in zip(sub_batch, idx_splits, lp_splits, tgt_splits):
-        _atomic_save_topk(item["target_st"], idx_s, lp_s, target_labels=tgt_s)
+        _atomic_save_topk(
+            item["target_st"],
+            idx_s,
+            lp_s,
+            target_labels=tgt_s,
+            source_labels=item["encoded"].get("labels"),
+            loss_scale=loss_scale,
+        )
 
 
 @torch.no_grad()
@@ -310,8 +339,10 @@ def _topk_worker_shard(
     gpu_id: Optional[str],
     shard_tasks: List[Tuple[str, Dict[str, Any]]],
     worker_cfg: Dict[str, Any],
+    *,
+    is_isolated_subprocess: bool = False,
 ) -> int:
-    if gpu_id is not None:
+    if gpu_id is not None and not is_isolated_subprocess:
         os.environ["CUDA_VISIBLE_DEVICES"] = "" if str(gpu_id).lower() == "cpu" else str(gpu_id)
 
     os.environ["IMAGE_MAX_TOKEN_NUM"] = str(worker_cfg["image_max_tokens"])
@@ -343,6 +374,9 @@ def _topk_worker_shard(
         )
         return 0
 
+    if is_isolated_subprocess:
+        _verify_and_log_gpu_pin(rank, gpu_id)
+
     req_dev = worker_cfg.get("device")
     if gpu_id is not None and str(gpu_id).lower() != "cpu":
         dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -357,16 +391,21 @@ def _topk_worker_shard(
     else:
         dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
 
+    loss_scale = str(worker_cfg.get("loss_scale") or "default+ignore_empty_think")
     attn_impl = _resolve_attn_impl(str(worker_cfg["attn_impl"]), dev)
     logger.info(
         f"[TopK Worker {rank}] GPU={gpu_id} device={dev} dtype={dt} attn={attn_impl} "
-        f"batch_size={worker_cfg['batch_size']} pack={worker_cfg['pack_sequences']}: "
+        f"loss_scale={loss_scale} batch_size={worker_cfg['batch_size']} pack={worker_cfg['pack_sequences']}: "
         f"extracting {len(pending)}/{len(shard_tasks)} unique samples..."
     )
 
     teacher_model_path = str(worker_cfg["teacher_model_path"])
     _, processor = get_model_processor(teacher_model_path, model_type="qwen3_5", load_model=False)
-    template = get_template(processor, template_type=QWEN3_5_TREEWEAVE_TEMPLATE_TYPE)
+    template = get_template(
+        processor,
+        template_type=QWEN3_5_TREEWEAVE_TEMPLATE_TYPE,
+        loss_scale=loss_scale,
+    )
     template.set_mode("train")
     template.topk_cache_dir = None
 
@@ -375,6 +414,8 @@ def _topk_worker_shard(
         dtype=dt,
         attn_implementation=attn_impl,
     ).to(dev)
+    # Enable single-pass varlen SDPA on Teacher too when `attn_impl='sdpa'`
+    install_volume_bias_on_language_model(teacher.model.language_model, mode="none")
     teacher.eval()
     template.model = teacher
 
@@ -393,6 +434,7 @@ def _topk_worker_shard(
             enc = template.encode(row)
             enc.pop("topk_cache_path", None)
             enc.pop("topk_active_tokens", None)
+            enc.pop("topk_active_targets", None)
             enc.pop("topk_truncation_side", None)
             exp_active = Qwen3_5TreeWeaveTemplate._count_active_supervised_tokens(enc.get("labels")) or 0
             encoded_window.append(
@@ -414,11 +456,23 @@ def _topk_worker_shard(
         for sub_batch in microbatches:
             if pack_sequences and len(sub_batch) > 1:
                 _run_packed_microbatch(
-                    teacher, template, sub_batch, dev=dev, topk=topk, temperature=temperature
+                    teacher,
+                    template,
+                    sub_batch,
+                    dev=dev,
+                    topk=topk,
+                    temperature=temperature,
+                    loss_scale=loss_scale,
                 )
             else:
                 _run_padded_microbatch(
-                    teacher, template, sub_batch, dev=dev, topk=topk, temperature=temperature
+                    teacher,
+                    template,
+                    sub_batch,
+                    dev=dev,
+                    topk=topk,
+                    temperature=temperature,
+                    loss_scale=loss_scale,
                 )
             computed += len(sub_batch)
 
@@ -442,12 +496,13 @@ def cache_dataset_topk(
     max_batch_tokens: int = 16384,
     pack_sequences: bool = False,
     attn_impl: str = "auto",
+    loss_scale: str = "default+ignore_empty_think",
     image_max_tokens: int = 4096,
     video_max_tokens: int = 512,
     max_frames: int = 64,
     max_samples: Optional[int] = None,
 ) -> Path:
-    """Precompute per-sample `(topk_indices int32, topk_logprobs float16)` safetensors files across 1..8 GPUs."""
+    """Precompute per-sample `(topk_indices int32, topk_logprobs float16, target_labels, source_labels)` shards."""
     enable_subprocess_resize_bootstrap(int(pixel_factor))
     cache_dir = Path(cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -494,6 +549,7 @@ def cache_dataset_topk(
         "max_batch_tokens": int(max_batch_tokens),
         "pack_sequences": bool(pack_sequences),
         "attn_impl": str(attn_impl),
+        "loss_scale": str(loss_scale),
         "image_max_tokens": int(image_max_tokens),
         "video_max_tokens": int(video_max_tokens),
         "max_frames": int(max_frames),
@@ -504,19 +560,59 @@ def cache_dataset_topk(
     if num_shards == 1:
         _topk_worker_shard(0, gpu_list[0], unique_tasks, worker_cfg)
     else:
-        ctx = mp.get_context("spawn")
-        procs = []
-        for r, gpu_id in enumerate(gpu_list):
-            p = ctx.Process(
-                target=_topk_worker_shard,
-                args=(r, gpu_id, unique_tasks[r::num_shards], worker_cfg),
-            )
-            p.start()
-            procs.append(p)
-        for p in procs:
-            p.join()
-            if p.exitcode != 0:
-                raise RuntimeError(f"Top-K cache worker exited with non-zero code {p.exitcode}.")
+        # Use `subprocess.Popen` with per-worker `CUDA_VISIBLE_DEVICES` set BEFORE child Python/CUDA init!
+        work_meta_dir = cache_dir / ".worker_manifests"
+        work_meta_dir.mkdir(parents=True, exist_ok=True)
+        cfg_file = work_meta_dir / f"worker_cfg_{os.getpid()}.json"
+        cfg_file.write_text(json.dumps(worker_cfg, ensure_ascii=False), encoding="utf-8")
+        repo_root = str(Path(__file__).resolve().parents[2])
+        procs: List[Tuple[int, subprocess.Popen]] = []
+        try:
+            for r, gpu_id in enumerate(gpu_list):
+                tasks_file = work_meta_dir / f"worker_{os.getpid()}_{r:02d}_tasks.jsonl"
+                with tasks_file.open("w", encoding="utf-8") as tf:
+                    for uid, item_row in unique_tasks[r::num_shards]:
+                        tf.write(json.dumps({"uid": uid, "row": item_row}, ensure_ascii=False) + "\n")
+
+                child_env = dict(os.environ)
+                existing_pp = child_env.get("PYTHONPATH", "")
+                if repo_root not in [p for p in existing_pp.split(os.pathsep) if p]:
+                    child_env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+                if gpu_id is not None:
+                    child_env["CUDA_VISIBLE_DEVICES"] = "" if str(gpu_id).lower() == "cpu" else str(gpu_id)
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "treeweave.rollout.cache_topk_logits",
+                    "--_worker-rank",
+                    str(r),
+                    "--_worker-gpu",
+                    "" if gpu_id is None else str(gpu_id),
+                    "--_worker-cfg",
+                    str(cfg_file),
+                    "--_worker-tasks",
+                    str(tasks_file),
+                ]
+                procs.append((r, subprocess.Popen(cmd, env=child_env)))
+
+            failed: List[Tuple[int, int]] = []
+            for r, proc in procs:
+                rc = proc.wait()
+                if rc != 0:
+                    failed.append((r, rc))
+            if failed:
+                raise RuntimeError(f"Top-K cache worker(s) exited with non-zero code: {failed}.")
+        except BaseException:
+            for _, proc in procs:
+                if proc.poll() is None:
+                    proc.terminate()
+            for _, proc in procs:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            raise
 
     written = 0
     with output_jsonl.open("w", encoding="utf-8") as out_f:
@@ -532,17 +628,23 @@ def cache_dataset_topk(
 
     logger.info(
         f"[TreeWeave TopK Cache] Cached {len(unique_tasks)} unique shards / {written} rows "
-        f"(K={topk}, DP={num_shards}) -> {output_jsonl}"
+        f"(K={topk}, DP={num_shards}, loss_scale={loss_scale}) -> {output_jsonl}"
     )
     return output_jsonl
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--teacher-model", required=True, help="Path or HF ID of native Qwen/Qwen3.5-4B teacher")
-    p.add_argument("--rollout-jsonl", required=True, type=Path, help="Input teacher rollout JSONL")
-    p.add_argument("--output-jsonl", required=True, type=Path, help="Output JSONL annotated with topk_cache_path")
-    p.add_argument("--cache-dir", required=True, type=Path, help="Directory for <uuid>.safetensors Top-K shards")
+    # Internal isolated worker flags (used by `subprocess.Popen` for strict per-GPU `CUDA_VISIBLE_DEVICES` isolation)
+    p.add_argument("--_worker-rank", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_worker-gpu", type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_worker-cfg", type=Path, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_worker-tasks", type=Path, default=None, help=argparse.SUPPRESS)
+
+    p.add_argument("--teacher-model", required=False, help="Path or HF ID of native Qwen/Qwen3.5-4B teacher")
+    p.add_argument("--rollout-jsonl", required=False, type=Path, help="Input teacher rollout JSONL")
+    p.add_argument("--output-jsonl", required=False, type=Path, help="Output JSONL annotated with topk_cache_path")
+    p.add_argument("--cache-dir", required=False, type=Path, help="Directory for <uuid>.safetensors Top-K shards")
     p.add_argument(
         "--gpus",
         default="0,1,2,3,4,5,6,7",
@@ -552,6 +654,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p.add_argument("--max-batch-tokens", type=int, default=16384, help="Token budget cap per microbatch")
     p.add_argument("--pack-sequences", action="store_true", help="Pack multiple samples padding-free per forward")
     p.add_argument("--attn-impl", choices=("auto", "flash_attention_2", "sdpa", "eager"), default="auto")
+    p.add_argument(
+        "--loss-scale",
+        default="default+ignore_empty_think",
+        help="ms-swift template loss_scale matching training (`default+ignore_empty_think` prevents BPE boundary drift)",
+    )
     p.add_argument("--topk", type=int, default=512)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--pixel-factor", type=int, default=128)
@@ -560,6 +667,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p.add_argument("--max-frames", type=int, default=64)
     p.add_argument("--max-samples", type=int, default=None)
     args = p.parse_args(argv)
+
+    if args._worker_rank is not None:
+        cfg = json.loads(args._worker_cfg.read_text(encoding="utf-8"))
+        shard_tasks: List[Tuple[str, Dict[str, Any]]] = []
+        with args._worker_tasks.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rec = json.loads(line)
+                    shard_tasks.append((rec["uid"], rec["row"]))
+        gpu_arg = args._worker_gpu if (args._worker_gpu is not None and args._worker_gpu != "") else None
+        _topk_worker_shard(
+            args._worker_rank,
+            gpu_arg,
+            shard_tasks,
+            cfg,
+            is_isolated_subprocess=True,
+        )
+        return
+
+    if not args.teacher_model or not args.rollout_jsonl or not args.output_jsonl or not args.cache_dir:
+        p.error("--teacher-model, --rollout-jsonl, --output-jsonl, and --cache-dir are required.")
 
     raw_gpus = args.gpus.strip()
     if raw_gpus.lower() in ("", "none"):
@@ -582,6 +710,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_batch_tokens=args.max_batch_tokens,
         pack_sequences=args.pack_sequences,
         attn_impl=args.attn_impl,
+        loss_scale=args.loss_scale,
         image_max_tokens=args.image_max_tokens,
         video_max_tokens=args.video_max_tokens,
         max_frames=args.max_frames,

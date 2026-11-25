@@ -43,6 +43,7 @@ from .router import RouterOutputs, SpatiotemporalTreeRouter
 from .volume_bias import (
     active_token_log_volumes,
     install_volume_bias_on_language_model,
+    varlen_bounds_context,
     volume_bias_context,
 )
 
@@ -56,16 +57,24 @@ __all__ = [
 
 
 def _has_fused_qwen3_5_varlen_kernels(language_model: nn.Module) -> bool:
-    """True when FlashAttention + Flash-Linear-Attention (`fla` + `causal_conv1d`) CUDA kernels are active."""
+    """True when Qwen3_5GatedDeltaNet (`fla` + `causal_conv1d`) AND full-attention varlen
+    (`flash_attention_*` OR TreeWeave's inner varlen SDPA patch) can execute a packed batch in ONE pass!
+    """
     if not torch.cuda.is_available():
         return False
-    attn_impl = str(getattr(language_model.config, "_attn_implementation", ""))
-    if "flash" not in attn_impl:
+    first_param = next(language_model.parameters(), None)
+    if first_param is not None and not first_param.is_cuda:
         return False
-    return (
+    has_linear_varlen = (
         importlib.util.find_spec("fla") is not None
         and importlib.util.find_spec("causal_conv1d") is not None
     )
+    if not has_linear_varlen:
+        return False
+    attn_impl = str(getattr(language_model.config, "_attn_implementation", ""))
+    if "flash" in attn_impl:
+        return True
+    return bool(getattr(language_model, "_treeweave_varlen_sdpa_patched", False))
 
 
 def _is_truly_packed_batch(
@@ -122,17 +131,35 @@ def _run_lm_varlen_safe(
     token_log_volumes: Optional[torch.Tensor] = None,
     **kwargs,
 ):
-    """Run `Qwen3_5TextModel` natively with fused CUDA varlen kernels on H100, or exact segment-isolated
-    execution when `cu_seq_lens_q` is passed without `flash-linear-attention` / `causal_conv1d` installed.
-    Passes `treeweave_token_log_volumes` explicitly through `kwargs` so non-reentrant gradient checkpointing
-    recomputes identical volume-biased keys/masks during `loss.backward()`.
+    """Run `Qwen3_5TextModel` in ONE fused pass on CUDA when `fla` + `causal_conv1d` are installed
+    (for BOTH `flash_attention_*` AND `sdpa` via TreeWeave's inner varlen SDPA patch!), or fall back to
+    exact segment-isolated execution on CPU / MPS / environments without `fla` + `causal_conv1d`.
     """
     eff_lv = token_log_volumes if token_log_volumes is not None else active_token_log_volumes()
     cu_q = kwargs.get("cu_seq_lens_q")
+    has_multi_seg = isinstance(cu_q, torch.Tensor) and int(cu_q.numel()) > 2
+    if has_multi_seg:
+        _maybe_install_qwen3_5_sp_linear_patch()
+
     if cu_q is None or past_key_values is not None or _has_fused_qwen3_5_varlen_kernels(language_model):
         call_kwargs = dict(kwargs)
         if eff_lv is not None:
             call_kwargs["treeweave_token_log_volumes"] = eff_lv
+        attn_impl = str(getattr(language_model.config, "_attn_implementation", "sdpa"))
+        if has_multi_seg and past_key_values is None and "flash" not in attn_impl:
+            # Padding-free packed sequence under varlen SDPA: pass `attention_mask=None` so `create_causal_mask`
+            # stays O(1) (`None`), and pre-fetch CPU `bounds` ONCE outside the 32-layer loop!
+            bounds = tuple(int(x) for x in cu_q.detach().cpu().tolist())
+            with varlen_bounds_context(bounds):
+                return language_model(
+                    input_ids=None,
+                    position_ids=position_ids,
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    **call_kwargs,
+                )
         return language_model(
             input_ids=None,
             position_ids=position_ids,
@@ -820,6 +847,8 @@ class Qwen3_5TreeWeaveForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 balance_loss=res.balance_loss,
                 treeweave_metrics=res.metrics,
             )
+        for unused_k in ("teacher_topk_indices", "teacher_topk_logprobs", "teacher_topk_valid_mask"):
+            kwargs.pop(unused_k, None)
         return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1016,6 +1045,7 @@ class Qwen3_5TreeWeaveForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         external_teacher: Optional[nn.Module] = None,
         teacher_topk_indices: Optional[torch.Tensor] = None,
         teacher_topk_logprobs: Optional[torch.Tensor] = None,
+        teacher_topk_valid_mask: Optional[torch.Tensor] = None,
         distill_topk: int = 512,
         distill_temperature: float = 1.0,
         distill_chunk_size: int = 1024,
@@ -1087,6 +1117,7 @@ class Qwen3_5TreeWeaveForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 teacher_lm_head=t_head,
                 teacher_topk_indices=teacher_topk_indices,
                 teacher_topk_logprobs=teacher_topk_logprobs,
+                teacher_topk_valid_mask=teacher_topk_valid_mask,
                 topk=distill_topk,
                 temperature=distill_temperature,
                 reduction=reduction,
@@ -1214,6 +1245,7 @@ class Qwen3_5TreeWeaveForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 teacher_lm_head=t_head,
                 teacher_topk_indices=teacher_topk_indices,
                 teacher_topk_logprobs=teacher_topk_logprobs,
+                teacher_topk_valid_mask=teacher_topk_valid_mask,
                 topk=distill_topk,
                 temperature=distill_temperature,
                 reduction="token_mean",
@@ -1348,6 +1380,7 @@ class Qwen3_5TreeWeaveForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             teacher_lm_head=t_head,
             teacher_topk_indices=teacher_topk_indices,
             teacher_topk_logprobs=teacher_topk_logprobs,
+            teacher_topk_valid_mask=teacher_topk_valid_mask,
             topk=distill_topk,
             temperature=distill_temperature,
             reduction=reduction,

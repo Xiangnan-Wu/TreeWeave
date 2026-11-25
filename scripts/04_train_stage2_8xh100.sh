@@ -18,6 +18,7 @@ MASTER_PORT="${MASTER_PORT:-29502}"
 MAX_STEPS="${MAX_STEPS:-2500}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
 LOGGING_STEPS="${LOGGING_STEPS:-10}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-8}"
 PACKING_LENGTH="${PACKING_LENGTH:-24576}"
 MAX_LENGTH="${MAX_LENGTH:-24576}"
@@ -47,7 +48,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE}" torchrun --nproc_per_node="${NPROC_PER_NODE}"
   --packing true \
   --packing_length "${PACKING_LENGTH}" \
   --max_length "${MAX_LENGTH}" \
-  --per_device_train_batch_size 1 \
+  --per_device_train_batch_size "${PER_DEVICE_BS}" \
   --gradient_accumulation_steps "${GRAD_ACCUM}" \
   --learning_rate 1e-5 \
   --lr_scheduler_type cosine \

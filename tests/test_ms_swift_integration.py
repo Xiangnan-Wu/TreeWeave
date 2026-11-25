@@ -476,6 +476,7 @@ def test_offline_topk_cache_max_length_truncation_alignment_in_padded_and_packed
             template_type=QWEN3_5_TREEWEAVE_TEMPLATE_TYPE,
             max_length=72,  # Tight enough to truncate ~half of Sample 0, loose enough to keep 100% of Sample 1!
             truncation_strategy="right",
+            loss_scale="default+ignore_empty_think",
         )
         tmpl.set_mode("train")
         tmpl.topk_cache_dir = str(cache_dir)
@@ -486,6 +487,9 @@ def test_offline_topk_cache_max_length_truncation_alignment_in_padded_and_packed
         trunc_n_short = enc_short["topk_active_tokens"]
         assert 0 < trunc_n_long < orig_n_long, f"Expected Sample 0 truncation, got {trunc_n_long}/{orig_n_long}"
         assert trunc_n_short == orig_n_short, f"Expected Sample 1 intact, got {trunc_n_short}/{orig_n_short}"
+        assert "source_labels" in raw_short
+        src_lbl = raw_short["source_labels"]
+        assert src_lbl.ndim == 1 and int((src_lbl[1:] != -100).sum().item()) == orig_n_short
 
         # 2a. Verify PADDED collation (`padding_free = False`) across MULTIPLE EPOCHS WITHOUT copying dicts!
         tmpl.padding_free = False
@@ -505,8 +509,36 @@ def test_offline_topk_cache_max_length_truncation_alignment_in_padded_and_packed
             assert torch.equal(got_pack_idx[:trunc_n_long], sentinel_long_idx[:trunc_n_long])
             assert torch.equal(got_pack_idx[trunc_n_long:], sentinel_short_idx)
 
-        # 2b-ii. Verify `loss_scale='default+ignore_empty_think'` (ms-swift SftArguments default for Qwen3.5!)
+        # 2b-ii. Verify backward compatibility with legacy `loss_scale='default'` caches consumed by
+        # `loss_scale='default+ignore_empty_think'` (ms-swift SftArguments default for Qwen3.5!):
         # skips the leading `<think>\n\n</think>\n\n` prefix (`s_off > 0`) rather than shifting `<think>` onto Student tokens!
+        legacy_cache_dir = root / "legacy_default_cache"
+        legacy_topk_jsonl = root / "legacy_default_topk.jsonl"
+        cache_dataset_topk(
+            teacher_model_path=str(native_dir),
+            rollout_jsonl=rollout_jsonl,
+            output_jsonl=legacy_topk_jsonl,
+            cache_dir=legacy_cache_dir,
+            topk=16,
+            pixel_factor=128,
+            device="cpu",
+            batch_size=2,
+            loss_scale="default",
+        )
+        raw_leg_long = load_file(str(legacy_cache_dir / f"{uid_long}.safetensors"))
+        raw_leg_short = load_file(str(legacy_cache_dir / f"{uid_short}.safetensors"))
+        leg_n_long = int(raw_leg_long["topk_indices"].shape[0])
+        leg_n_short = int(raw_leg_short["topk_indices"].shape[0])
+        sent_leg_long = torch.arange(leg_n_long, dtype=torch.int32)[:, None].expand(leg_n_long, 16).contiguous()
+        sent_leg_short = (100 + torch.arange(leg_n_short, dtype=torch.int32))[:, None].expand(leg_n_short, 16).contiguous()
+        save_file(
+            {"topk_indices": sent_leg_long, "topk_logprobs": raw_leg_long["topk_logprobs"], "target_labels": raw_leg_long["target_labels"]},
+            str(legacy_cache_dir / f"{uid_long}.safetensors"),
+        )
+        save_file(
+            {"topk_indices": sent_leg_short, "topk_logprobs": raw_leg_short["topk_logprobs"], "target_labels": raw_leg_short["target_labels"]},
+            str(legacy_cache_dir / f"{uid_short}.safetensors"),
+        )
         tmpl_ignore_think = get_template(
             processor,
             template_type=QWEN3_5_TREEWEAVE_TEMPLATE_TYPE,
@@ -515,18 +547,18 @@ def test_offline_topk_cache_max_length_truncation_alignment_in_padded_and_packed
             loss_scale="default+ignore_empty_think",
         )
         tmpl_ignore_think.set_mode("train")
-        tmpl_ignore_think.topk_cache_dir = str(cache_dir)
+        tmpl_ignore_think.topk_cache_dir = str(legacy_cache_dir)
         tmpl_ignore_think.padding_free = True
         enc_long_it = tmpl_ignore_think.encode(long_sample)
         enc_short_it = tmpl_ignore_think.encode(short_sample)
         n_long_it = enc_long_it["topk_active_tokens"]
         n_short_it = enc_short_it["topk_active_tokens"]
-        think_skip = orig_n_short - n_short_it
+        think_skip = leg_n_short - n_short_it
         assert think_skip > 0  # `<think>\n\n</think>\n\n` tokens were masked to -100 by ignore_empty_think!
         collated_it = tmpl_ignore_think.data_collator([enc_long_it, enc_short_it])
         got_it_idx = collated_it["teacher_topk_indices"]
-        assert torch.equal(got_it_idx[:n_long_it], sentinel_long_idx[think_skip : think_skip + n_long_it])
-        assert torch.equal(got_it_idx[n_long_it:], sentinel_short_idx[think_skip : think_skip + n_short_it])
+        assert torch.equal(got_it_idx[:n_long_it], sent_leg_long[think_skip : think_skip + n_long_it])
+        assert torch.equal(got_it_idx[n_long_it:], sent_leg_short[think_skip : think_skip + n_short_it])
 
         # 2c. Verify extreme truncation where Sample 0 loses ALL response tokens (`topk_active_tokens == 0`)!
         tmpl_extreme = get_template(
@@ -534,6 +566,7 @@ def test_offline_topk_cache_max_length_truncation_alignment_in_padded_and_packed
             template_type=QWEN3_5_TREEWEAVE_TEMPLATE_TYPE,
             max_length=28,
             truncation_strategy="right",
+            loss_scale="default+ignore_empty_think",
         )
         tmpl_extreme.set_mode("train")
         tmpl_extreme.topk_cache_dir = str(cache_dir)

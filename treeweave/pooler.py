@@ -225,26 +225,27 @@ class TreeWeavePyramid(nn.Module):
 
         Each `X_{s, t}` has shape `(T // 2^t, H_s, W_s, d)` where post-merger grid is `(H_s // 2, W_s // 2)`.
         """
+        base_dtype = x_raster.dtype
         pyramid: Dict[Tuple[int, int], torch.Tensor] = {(0, 0): x_raster}
         if max_spatial_level >= 1:
-            pyramid[(1, 0)] = self.spatial_pooler_1(pyramid[(0, 0)])
+            pyramid[(1, 0)] = self.spatial_pooler_1(pyramid[(0, 0)]).to(dtype=base_dtype)
         if max_spatial_level >= 2 and (1, 0) in pyramid:
             # Only pool full 2x2 macroblocks (post-merger requires 2x2 of X_{2,0}, i.e. 4x4 of X_{1,0})
             x10 = pyramid[(1, 0)]
             h1_macro = (x10.shape[1] // 4) * 4
             w1_macro = (x10.shape[2] // 4) * 4
             if h1_macro > 0 and w1_macro > 0:
-                pyramid[(2, 0)] = self.spatial_pooler_2(x10[:, :h1_macro, :w1_macro, :])
+                pyramid[(2, 0)] = self.spatial_pooler_2(x10[:, :h1_macro, :w1_macro, :]).to(dtype=base_dtype)
 
         t_len = x_raster.shape[0]
         if max_temporal_level >= 1 and t_len >= 2:
             for s in range(max_spatial_level + 1):
                 if (s, 0) in pyramid and pyramid[(s, 0)].shape[1] >= self.fine and pyramid[(s, 0)].shape[2] >= self.fine:
-                    pyramid[(s, 1)] = self.temporal_pooler_1(pyramid[(s, 0)])
+                    pyramid[(s, 1)] = self.temporal_pooler_1(pyramid[(s, 0)]).to(dtype=base_dtype)
         if max_temporal_level >= 2 and t_len >= 4:
             for s in range(max_spatial_level + 1):
                 if (s, 1) in pyramid and pyramid[(s, 1)].shape[0] >= 2:
-                    pyramid[(s, 2)] = self.temporal_pooler_2(pyramid[(s, 1)])
+                    pyramid[(s, 2)] = self.temporal_pooler_2(pyramid[(s, 1)]).to(dtype=base_dtype)
         return pyramid
 
     def project_all_scales(
@@ -328,7 +329,8 @@ class TreeWeavePyramid(nn.Module):
                         tau_t * (out_h * out_w) + i_s * out_w + j_s
                     ).to(device=device, dtype=torch.long)
                     pos_idx = torch.from_numpy(mask_np.nonzero()[0]).to(device=device, dtype=torch.long)
-                    item_blocks.index_copy_(0, pos_idx, blocks_st.index_select(0, flat_idx))
+                    gathered = blocks_st.index_select(0, flat_idx).to(dtype=item_blocks.dtype)
+                    item_blocks.index_copy_(0, pos_idx, gathered)
 
             selected_blocks.append(item_blocks)
 

@@ -19,10 +19,11 @@ import argparse
 import copy
 import hashlib
 import json
-import multiprocessing as mp
 import os
+import subprocess
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from swift.utils import get_logger
 
@@ -307,14 +308,35 @@ def _format_completion(choice) -> str:
     return content
 
 
+def _verify_and_log_gpu_pin(rank: int, gpu_id: Optional[str]) -> None:
+    """Assert single-GPU isolation in worker process before loading any model weights."""
+    import torch
+
+    env_val = os.environ.get("CUDA_VISIBLE_DEVICES")
+    cuda_avail = torch.cuda.is_available()
+    visible = torch.cuda.device_count() if cuda_avail else 0
+    logger.info(
+        f"[GPU-PIN] rank={rank} assigned_gpu={gpu_id!r} CUDA_VISIBLE_DEVICES={env_val!r} visible={visible}"
+    )
+    if gpu_id is not None and str(gpu_id).lower() != "cpu" and cuda_avail:
+        if visible != 1:
+            raise RuntimeError(
+                f"[GPU-PIN] Worker rank={rank} expected exactly 1 visible CUDA device for gpu_id={gpu_id!r}, "
+                f"got visible={visible} (CUDA_VISIBLE_DEVICES={env_val!r})."
+            )
+        torch.cuda.set_device(0)
+
+
 def _worker_process_shard(
     rank: int,
     gpu_id: Optional[str],
     shard_rows: List[Dict[str, Any]],
     shard_output_path: str,
     worker_cfg: Dict[str, Any],
+    *,
+    is_isolated_subprocess: bool = False,
 ) -> int:
-    if gpu_id is not None:
+    if gpu_id is not None and not is_isolated_subprocess:
         os.environ["CUDA_VISIBLE_DEVICES"] = "" if str(gpu_id).lower() == "cpu" else str(gpu_id)
 
     enable_subprocess_resize_bootstrap(int(worker_cfg["pixel_factor"]))
@@ -347,6 +369,9 @@ def _worker_process_shard(
     if not pending:
         logger.info(f"[Rollout Worker {rank}] All {len(shard_rows)} samples already cached in {out_file}.")
         return 0
+
+    if is_isolated_subprocess:
+        _verify_and_log_gpu_pin(rank, gpu_id)
 
     backend = resolve_rollout_backend(worker_cfg["backend"])
     logger.info(
@@ -476,19 +501,59 @@ def run_sharded_rollout(
     if num_shards == 1:
         _worker_process_shard(0, gpu_list[0], rows, str(shard_paths[0]), worker_cfg)
     else:
-        ctx = mp.get_context("spawn")
-        procs = []
-        for r, gpu_id in enumerate(gpu_list):
-            p = ctx.Process(
-                target=_worker_process_shard,
-                args=(r, gpu_id, rows[r::num_shards], str(shard_paths[r]), worker_cfg),
-            )
-            p.start()
-            procs.append(p)
-        for p in procs:
-            p.join()
-            if p.exitcode != 0:
-                raise RuntimeError(f"Rollout worker exited with non-zero code {p.exitcode}.")
+        # Use `subprocess.Popen` with per-worker `CUDA_VISIBLE_DEVICES` set BEFORE child Python/CUDA init!
+        cfg_file = shard_dir / "worker_cfg.json"
+        cfg_file.write_text(json.dumps(worker_cfg, ensure_ascii=False), encoding="utf-8")
+        repo_root = str(Path(__file__).resolve().parents[2])
+        procs: List[Tuple[int, subprocess.Popen]] = []
+        try:
+            for r, gpu_id in enumerate(gpu_list):
+                in_shard_file = shard_dir / f"worker_{r:02d}_in.jsonl"
+                with in_shard_file.open("w", encoding="utf-8") as f_in:
+                    for item in rows[r::num_shards]:
+                        f_in.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+                child_env = dict(os.environ)
+                existing_pp = child_env.get("PYTHONPATH", "")
+                if repo_root not in [p for p in existing_pp.split(os.pathsep) if p]:
+                    child_env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+                if gpu_id is not None:
+                    child_env["CUDA_VISIBLE_DEVICES"] = "" if str(gpu_id).lower() == "cpu" else str(gpu_id)
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "treeweave.rollout.offline_rollout",
+                    "--_worker-rank",
+                    str(r),
+                    "--_worker-gpu",
+                    "" if gpu_id is None else str(gpu_id),
+                    "--_worker-cfg",
+                    str(cfg_file),
+                    "--_worker-input",
+                    str(in_shard_file),
+                    "--_worker-output",
+                    str(shard_paths[r]),
+                ]
+                procs.append((r, subprocess.Popen(cmd, env=child_env)))
+
+            failed: List[Tuple[int, int]] = []
+            for r, proc in procs:
+                rc = proc.wait()
+                if rc != 0:
+                    failed.append((r, rc))
+            if failed:
+                raise RuntimeError(f"Rollout worker(s) exited with non-zero code: {failed}.")
+        except BaseException:
+            for _, proc in procs:
+                if proc.poll() is None:
+                    proc.terminate()
+            for _, proc in procs:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            raise
 
     # Deterministically merge shards in original input order
     by_uuid: Dict[str, Dict[str, Any]] = {}
@@ -517,9 +582,16 @@ def run_sharded_rollout(
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", required=True, help="Path or HF ID of native Qwen/Qwen3.5-4B teacher")
-    p.add_argument("--input-jsonl", required=True, type=Path, help="Input multimodal JSONL dataset")
-    p.add_argument("--output-jsonl", required=True, type=Path, help="Output reusable teacher rollout JSONL")
+    # Internal isolated worker flags (used by `subprocess.Popen` for strict per-GPU `CUDA_VISIBLE_DEVICES` isolation)
+    p.add_argument("--_worker-rank", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_worker-gpu", type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_worker-cfg", type=Path, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_worker-input", type=Path, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--_worker-output", type=Path, default=None, help=argparse.SUPPRESS)
+
+    p.add_argument("--model", required=False, help="Path or HF ID of native Qwen/Qwen3.5-4B teacher")
+    p.add_argument("--input-jsonl", required=False, type=Path, help="Input multimodal JSONL dataset")
+    p.add_argument("--output-jsonl", required=False, type=Path, help="Output reusable teacher rollout JSONL")
     p.add_argument("--gpus", default="0,1,2,3,4,5,6,7", help="Comma-separated GPU IDs for DP=N sharding (use 'cpu' on CPU)")
     p.add_argument("--backend", choices=("auto", "sglang", "vllm", "transformers"), default="auto")
     p.add_argument("--max-new-tokens", type=int, default=1024)
@@ -536,6 +608,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p.add_argument("--pixel-factor", type=int, default=128)
     p.add_argument("--max-samples", type=int, default=None)
     args = p.parse_args(argv)
+
+    if args._worker_rank is not None:
+        cfg = json.loads(args._worker_cfg.read_text(encoding="utf-8"))
+        shard_rows = load_input_jsonl(args._worker_input)
+        gpu_arg = args._worker_gpu if (args._worker_gpu is not None and args._worker_gpu != "") else None
+        _worker_process_shard(
+            args._worker_rank,
+            gpu_arg,
+            shard_rows,
+            str(args._worker_output),
+            cfg,
+            is_isolated_subprocess=True,
+        )
+        return
+
+    if not args.model or not args.input_jsonl or not args.output_jsonl:
+        p.error("--model, --input-jsonl, and --output-jsonl are required.")
 
     gpus = None if args.gpus.strip().lower() in ("", "cpu", "none") else [g.strip() for g in args.gpus.split(",") if g.strip()]
     run_sharded_rollout(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from safetensors.torch import load_file
@@ -17,6 +17,24 @@ logger = get_logger()
 
 _PATCH_ATTR = "_treeweave_patched_factor"
 _CURRENT_PIXEL_FACTOR: int = int(os.environ.get("TREEWEAVE_PIXEL_FACTOR", "128"))
+
+# Audit counters tracking offline Top-K label alignment across DataLoader batches
+_TOPK_ALIGNMENT_STATS: Dict[str, int] = {
+    "exact": 0,
+    "pos0_bpe_boundary": 0,
+    "mismatched": 0,
+}
+
+
+def get_topk_alignment_stats() -> Dict[str, int]:
+    """Return a snapshot of offline Top-K cache alignment counts."""
+    return dict(_TOPK_ALIGNMENT_STATS)
+
+
+def reset_topk_alignment_stats() -> None:
+    """Reset offline Top-K cache alignment counters (useful in tests/eval)."""
+    for k in _TOPK_ALIGNMENT_STATS:
+        _TOPK_ALIGNMENT_STATS[k] = 0
 
 
 def get_treeweave_pixel_factor() -> int:
@@ -218,6 +236,78 @@ class Qwen3_5TreeWeaveTemplate(Qwen3_5Template):
         return None
 
     @classmethod
+    def _align_cached_targets(
+        cls,
+        tgt_long: torch.Tensor,
+        needle: torch.Tensor,
+        *,
+        side: str,
+        path: str,
+    ) -> Tuple[int, torch.Tensor]:
+        """Align cached Teacher `target_labels` with Student supervised `needle`.
+
+        Returns `(start_offset, valid_mask)` where `valid_mask` is a 1D bool tensor of length `len(needle)`:
+        1. Exact contiguous match -> all `True` (`stats["exact"] += 1`).
+        2. Exact 1-token pos-0 BPE boundary drift (legacy caches generated with `loss_scale='default'`
+           when training uses `loss_scale='default+ignore_empty_think'`, causing `\\n\\n + content[0]`
+           to differ ONLY at position 0 while `needle[1:]` matches bit-for-bit) -> `valid_mask[0] = False`,
+           `valid_mask[1:] = True` (`stats["pos0_bpe_boundary"] += 1`).
+        3. Any other mismatch -> `stats["mismatched"] += 1` and raises `ValueError`.
+        """
+        n_cache = int(tgt_long.shape[0])
+        exp_cnt = int(needle.shape[0])
+
+        # 1) Exact match
+        s_exact: Optional[int] = None
+        if side == "left":
+            s_cand = n_cache - exp_cnt
+            if bool(torch.equal(tgt_long[s_cand:], needle)):
+                s_exact = s_cand
+            else:
+                s_exact = cls._find_contiguous_subarray(tgt_long, needle)
+        else:
+            s_exact = cls._find_contiguous_subarray(tgt_long, needle)
+
+        if s_exact is not None:
+            _TOPK_ALIGNMENT_STATS["exact"] += 1
+            return s_exact, torch.ones(exp_cnt, dtype=torch.bool)
+
+        # 2) Legacy 1-token pos-0 BPE boundary drift (`needle[1:]` matches contiguously, ONLY pos 0 differs)
+        if exp_cnt >= 2 and n_cache >= exp_cnt:
+            tail_needle = needle[1:]
+            s_pos0: Optional[int] = None
+            s_suffix = n_cache - exp_cnt
+            if bool(torch.equal(tgt_long[s_suffix + 1 : s_suffix + exp_cnt], tail_needle)):
+                s_pos0 = s_suffix
+            elif exp_cnt >= 3:
+                s_tail = cls._find_contiguous_subarray(tgt_long[1:], tail_needle)
+                if s_tail is not None:
+                    s_pos0 = s_tail
+
+            if s_pos0 is not None:
+                _TOPK_ALIGNMENT_STATS["pos0_bpe_boundary"] += 1
+                hits = _TOPK_ALIGNMENT_STATS["pos0_bpe_boundary"]
+                if hits <= 3 or hits % 500 == 0:
+                    logger.warning(
+                        f"[TreeWeave Top-K Audit] Legacy pos-0 BPE boundary diff in {Path(path).name}: "
+                        f"cached_tok0={int(tgt_long[s_pos0].item())} vs student_tok0={int(needle[0].item())} "
+                        f"(remaining {exp_cnt - 1}/{exp_cnt} tokens match identically). "
+                        f"Masking ONLY pos-0 via `teacher_topk_valid_mask`. "
+                        f"Cumulative stats={dict(_TOPK_ALIGNMENT_STATS)}."
+                    )
+                valid = torch.ones(exp_cnt, dtype=torch.bool)
+                valid[0] = False
+                return s_pos0, valid
+
+        # 3) Genuine misalignment -> fail loudly
+        _TOPK_ALIGNMENT_STATS["mismatched"] += 1
+        raise ValueError(
+            f"Offline Top-K `target_labels` in {path!r} do not match Student supervised `labels` "
+            f"(cached_len={n_cache}, expected_len={exp_cnt}, "
+            f"cached_head={tgt_long[:8].tolist()}, expected_head={needle[:8].tolist()})."
+        )
+
+    @classmethod
     def _load_offline_topk_list(
         cls,
         paths: List[str],
@@ -236,6 +326,7 @@ class Qwen3_5TreeWeaveTemplate(Qwen3_5Template):
         idx_parts: List[torch.Tensor] = []
         lp_parts: List[torch.Tensor] = []
         tgt_parts: List[torch.Tensor] = []
+        valid_parts: List[torch.Tensor] = []
         all_have_targets = True
         k_width: Optional[int] = None
         fallback_k: int = 1
@@ -260,6 +351,7 @@ class Qwen3_5TreeWeaveTemplate(Qwen3_5Template):
             if idx.shape[1] > 0:
                 fallback_k = int(idx.shape[1])
 
+            shard_valid: Optional[torch.Tensor] = None
             if exp_cnt is not None:
                 if exp_cnt < 0 or exp_cnt > idx.shape[0]:
                     raise ValueError(
@@ -271,27 +363,13 @@ class Qwen3_5TreeWeaveTemplate(Qwen3_5Template):
                     lp = lp[:0]
                     if tgt is not None:
                         tgt = tgt[:0]
+                    shard_valid = torch.ones(0, dtype=torch.bool)
                 elif tgt is not None and exp_tgt is not None and len(exp_tgt) == exp_cnt:
                     tgt_long = tgt.to(torch.long)
                     needle = torch.tensor(exp_tgt, dtype=torch.long)
-                    if side == "left":
-                        s_off = int(idx.shape[0]) - exp_cnt
-                        if not bool(torch.equal(tgt_long[s_off:], needle)):
-                            s_off_alt = cls._find_contiguous_subarray(tgt_long, needle)
-                            if s_off_alt is None:
-                                raise ValueError(
-                                    f"Offline Top-K `target_labels` in {p!r} do not match Student supervised `labels`."
-                                )
-                            s_off = s_off_alt
-                    else:
-                        # Handles both `loss_scale='default'` (s_off=0) and `default+ignore_empty_think`
-                        # (s_off = empty `<think>\n\n</think>\n\n` prefix length) + right-truncation!
-                        s_off_found = cls._find_contiguous_subarray(tgt_long, needle)
-                        if s_off_found is None:
-                            raise ValueError(
-                                f"Offline Top-K `target_labels` in {p!r} do not match Student supervised `labels`."
-                            )
-                        s_off = s_off_found
+                    s_off, shard_valid = cls._align_cached_targets(
+                        tgt_long, needle, side=side, path=p
+                    )
                     idx = idx[s_off : s_off + exp_cnt]
                     lp = lp[s_off : s_off + exp_cnt]
                     tgt = tgt[s_off : s_off + exp_cnt]
@@ -307,6 +385,9 @@ class Qwen3_5TreeWeaveTemplate(Qwen3_5Template):
                         if tgt is not None:
                             tgt = tgt[:exp_cnt]
 
+            if shard_valid is None:
+                shard_valid = torch.ones(int(idx.shape[0]), dtype=torch.bool)
+
             if idx.shape[0] > 0:
                 if k_width is None:
                     k_width = int(idx.shape[1])
@@ -316,6 +397,7 @@ class Qwen3_5TreeWeaveTemplate(Qwen3_5Template):
                     )
             idx_parts.append(idx)
             lp_parts.append(lp)
+            valid_parts.append(shard_valid)
             if tgt is not None:
                 tgt_parts.append(tgt.to(torch.long))
             else:
@@ -334,6 +416,9 @@ class Qwen3_5TreeWeaveTemplate(Qwen3_5Template):
             "teacher_topk_indices": torch.cat(norm_idx, dim=0),
             "teacher_topk_logprobs": torch.cat(norm_lp, dim=0),
         }
+        valid_mask = torch.cat(valid_parts, dim=0)
+        if valid_mask.numel() > 0 and not bool(valid_mask.all()):
+            out["teacher_topk_valid_mask"] = valid_mask
         if all_have_targets and len(tgt_parts) == len(paths):
             out["_teacher_target_labels"] = torch.cat(tgt_parts, dim=0)
         return out
@@ -455,13 +540,18 @@ class Qwen3_5TreeWeaveTemplate(Qwen3_5Template):
                             f"Collated batch has {collated_active} active supervised tokens, "
                             f"but sliced offline Top-K cache produced {cached_active}."
                         )
-                    if cached_targets is not None and not torch.equal(
-                        cached_targets.long(), active_pos.target_labels.detach().cpu().long()
-                    ):
-                        raise ValueError(
-                            "Offline Top-K `target_labels` do not match Student supervised `labels` "
-                            "after truncation/packing; Teacher Top-K cache is misaligned with this sample."
-                        )
+                    if cached_targets is not None:
+                        valid_mask = loaded.get("teacher_topk_valid_mask")
+                        tgt_cached = cached_targets.long()
+                        tgt_student = active_pos.target_labels.detach().cpu().long()
+                        if valid_mask is not None:
+                            tgt_cached = tgt_cached[valid_mask]
+                            tgt_student = tgt_student[valid_mask]
+                        if not torch.equal(tgt_cached, tgt_student):
+                            raise ValueError(
+                                "Offline Top-K `target_labels` do not match Student supervised `labels` "
+                                "after truncation/packing; Teacher Top-K cache is misaligned with this sample."
+                            )
                 res.update(loaded)
         return res
 

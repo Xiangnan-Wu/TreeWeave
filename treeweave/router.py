@@ -256,11 +256,21 @@ def _binary_compress_prob(
     budget_shift: float,
     features: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute `P(compress)` in FP32 from `features (..., d)`."""
+    """Compute `P(compress)` in FP32 from `features (..., d)` safely even when DeepSpeed/FSDP casts weights to BF16."""
     if features.numel() == 0:
         return torch.zeros(features.shape[:-1], dtype=torch.float32, device=features.device)
     orig_shape = features.shape[:-1]
-    logits = head(features.float().reshape(-1, features.shape[-1])) + last_bias.float()
+    x = features.reshape(-1, features.shape[-1]).float()
+    if isinstance(head, nn.Sequential) and len(head) == 2 and isinstance(head[0], nn.LayerNorm) and isinstance(head[1], nn.Linear):
+        ln, lin = head[0], head[1]
+        w_ln = ln.weight.float() if ln.weight is not None else None
+        b_ln = ln.bias.float() if ln.bias is not None else None
+        x = F.layer_norm(x, ln.normalized_shape, w_ln, b_ln, ln.eps)
+        b_lin = lin.bias.float() if lin.bias is not None else None
+        logits = F.linear(x, lin.weight.float(), b_lin) + last_bias.float()
+    else:
+        head_dtype = next(head.parameters(), features).dtype
+        logits = head(x.to(dtype=head_dtype)).float() + last_bias.float()
     total_shift = calib_bias.float() + float(budget_shift)
     logits = logits + torch.stack((torch.zeros_like(total_shift), total_shift)).unsqueeze(0)
     probs = torch.softmax(logits.float(), dim=-1)[:, 1]
